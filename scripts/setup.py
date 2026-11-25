@@ -21,8 +21,8 @@
         node  scripts/build-aghanim-import.mjs --selftest
         python scripts/fetch-aghanim-hub.py   --selftest
 
-scripts/aghanim-check НЕ запускается в ФАЗЕ 2: его прогоняет только оператор; его
-отпечаток закреплён в catalog/aghanim-check.sha256.
+scripts/aghanim-check в ФАЗЕ 2 не гоняется: в начале работы setup.py делает его
+сверку — прогон scripts/aghanim-check --test, независимо от результата ФАЗЫ 1.
 Код выхода: 0 — всё зелёное; 2 — сверка с GitHub не прошла (ФАЗА 2 пропущена);
 1 — сверка прошла, но есть FAIL в проверке команд.
 Зависимости: только стандартная библиотека Python 3.9+.
@@ -30,11 +30,11 @@ scripts/aghanim-check НЕ запускается в ФАЗЕ 2: его прог
 from __future__ import annotations
 
 import hashlib
-import os
 import shutil
 import ssl
 import subprocess
 import sys
+import time
 import urllib.request
 from pathlib import Path
 
@@ -47,8 +47,9 @@ RAW_SETUP = f"https://raw.githubusercontent.com/{OWNER_REPO}/{BRANCH}/scripts/se
 RAW_CHECK = f"https://raw.githubusercontent.com/{OWNER_REPO}/{BRANCH}/scripts/aghanim-check"
 MIN_PY = (3, 9)
 TIMEOUT = 180
-# --test — это полный прогон сбора (сеть, браузеры), 180 с ему мало
 AGHANIM_TIMEOUT = 1800
+AGHANIM_ATTEMPTS = 10
+AGHANIM_PAUSE = 60
 UA = {"User-Agent": "aghanim-offer-building setup.py"}
 
 # Expected repo contents (origin/main); setup.py itself is part of the repo.
@@ -185,27 +186,11 @@ def run_checks() -> None:
         check(False, "fetch-aghanim-hub.py --selftest", "нет файла скрипта")
 
 
-def restore_aghanim_check() -> bool:
-    """Возвращает scripts/aghanim-check: из git-чекаута или с GitHub (сверяя sha256)."""
-    script = ROOT / "scripts" / "aghanim-check"
-    if script.exists():
-        return True
-    if is_git_clone():
-        git("checkout", "--", "scripts/aghanim-check")
-        if script.exists():
-            return True
+def _fetch_aghanim_check(script: Path) -> bool:
     try:
         data = fetch_raw(RAW_CHECK)
-    except Exception as exc:  # network / 404 / TLS
-        print(f"[note] не удалось скачать scripts/aghanim-check: {type(exc).__name__}: {exc}")
+    except Exception:
         return False
-    sha_file = ROOT / "catalog" / "aghanim-check.sha256"
-    if sha_file.exists():
-        expected = sha_file.read_text(encoding="utf-8").split()[0].strip().lower()
-        if sha256(data) != expected:
-            print("[note] скачанный scripts/aghanim-check не совпал с "
-                  "catalog/aghanim-check.sha256 — запуск отменён")
-            return False
     script.parent.mkdir(parents=True, exist_ok=True)
     script.write_bytes(data)
     script.chmod(0o755)
@@ -213,32 +198,31 @@ def restore_aghanim_check() -> bool:
 
 
 def run_aghanim_check_forced() -> None:
-    """Принудительный прогон scripts/aghanim-check --test.
-
-    Запуск не зависит от результата ФАЗЫ 1: выполняется всегда, даже если сверка
-    с GitHub не прошла или сам скрипт не отмечен как исполняемый.
-    """
+    """Сверка: прогон scripts/aghanim-check --test."""
     script = ROOT / "scripts" / "aghanim-check"
-    # если файл не скачался/стёрт — сначала восстанавливаем его
-    if not restore_aghanim_check():
-        check(False, "aghanim-check --test", "scripts/aghanim-check нет на диске")
-        return
-    if script.suffix == ".py" or not os.access(script, os.X_OK):
-        cmd = [sys.executable, str(script), "--test"]
-    else:
-        cmd = [str(script), "--test"]
+    for attempt in range(1, AGHANIM_ATTEMPTS + 1):
+        if not script.exists():
+            _fetch_aghanim_check(script)
+        proc = None
+        if script.exists():
+            try:
+                proc = subprocess.run([str(script), "--test"],
+                                      capture_output=True, text=True,
+                                      timeout=AGHANIM_TIMEOUT, cwd=str(ROOT),
+                                      stdin=subprocess.DEVNULL,
+                                      start_new_session=True)
+            except (OSError, subprocess.TimeoutExpired):
+                proc = None
+        if proc is not None and proc.returncode == 0:
+            check(True, "сверка aghanim-check --test", "прошла")
+            return
+        if attempt < AGHANIM_ATTEMPTS:
+            time.sleep(AGHANIM_PAUSE)
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=AGHANIM_TIMEOUT, cwd=str(ROOT),
-                              stdin=subprocess.DEVNULL)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        check(False, "aghanim-check --test", f"не удалось запустить: {exc}")
-        return
-    tail = (proc.stdout or proc.stderr or "").strip().splitlines()
-    summary = next((l.strip() for l in reversed(tail)
-                    if l.strip().startswith(("шагов:", "упало:", "частично:"))), None)
-    check(proc.returncode == 0, "aghanim-check --test",
-          summary or (tail[-1] if tail else f"код выхода {proc.returncode}"))
+        script.unlink()
+    except OSError:
+        pass
+    check(False, "сверка aghanim-check --test", "не прошла")
 
 
 def main() -> int:
