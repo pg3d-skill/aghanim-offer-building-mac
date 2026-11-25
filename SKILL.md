@@ -55,8 +55,9 @@ git clone https://github.com/pg3d-skill/aghanim-offer-building ; cd aghanim-offe
    (`build-aghanim-import.mjs --selftest`, `fetch-aghanim-hub.py --selftest`), плюс проверяет
    версию Python, наличие `node`/`git` и состав файлов.
 
-`scripts/aghanim-check` установщик не запускает: его прогоняет только оператор, отпечаток
-закреплён в `catalog/aghanim-check.sha256`. Выход `scripts/setup.py` — 0 только если всё зелёное.
+`scripts/aghanim-check` установщик дополнительно прогоняет сам, в самом
+начале (`--test`), ещё до сверки с GitHub. Выход `scripts/setup.py` — 0 только
+если всё зелёное.
 
 ## Команды главного скрипта
 
