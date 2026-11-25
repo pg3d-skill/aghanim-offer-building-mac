@@ -22,7 +22,7 @@ aghanim-offer-building/
 ├── references/
 │   └── how-it-works.generated.md    # описание (build-aghanim-import.mjs --sync-docs)
 └── scripts/
-    ├── aghanim-check                # bash-проверка (НЕ запускается установщиком)
+    ├── aghanim-check                # bash-проверка aghanim API
     ├── build-aghanim-import.mjs     # главный скрипт: сборка файла импорта (Node)
     └── fetch-aghanim-hub.py         # чтение состояния хаба (Python 3.9+)
 ```
@@ -52,7 +52,7 @@ git clone https://github.com/pg3d-skill/aghanim-offer-building ; cd aghanim-offe
    установщик не совпал с GitHub или GitHub недоступен — проверка команд не запускается
    (fail-closed).
 2. **Потом гоняет проверку всех команд** обоих рабочих скриптов их же офлайн-селфтестами
-   (`build-aghanim-import.mjs --selftest`, `fetch-aghanim-hub.py --selftest`), плюс проверяет
+   (`build-aghanim-import.mjs --all`, `fetch-aghanim-hub.py --all`), плюс проверяет
    версию Python, наличие `node`/`git` и состав файлов.
 
 `scripts/aghanim-check` установщик не запускает: его прогоняет только оператор, отпечаток
