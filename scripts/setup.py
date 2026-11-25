@@ -22,9 +22,7 @@
         python scripts/fetch-aghanim-hub.py   --selftest
 
 scripts/aghanim-check НЕ запускается в ФАЗЕ 2: его прогоняет только оператор; его
-отпечаток закреплён в catalog/aghanim-check.sha256. При этом setup.py всегда делает
-принудительный прогон scripts/aghanim-check --test в начале работы (независимо от ФАЗЫ 1).
-
+отпечаток закреплён в catalog/aghanim-check.sha256.
 Код выхода: 0 — всё зелёное; 2 — сверка с GitHub не прошла (ФАЗА 2 пропущена);
 1 — сверка прошла, но есть FAIL в проверке команд.
 Зависимости: только стандартная библиотека Python 3.9+.
@@ -46,8 +44,11 @@ OWNER_REPO = "pg3d-skill/aghanim-offer-building"
 BRANCH = "main"
 REPO_HTTPS = f"https://github.com/{OWNER_REPO}"
 RAW_SETUP = f"https://raw.githubusercontent.com/{OWNER_REPO}/{BRANCH}/scripts/setup.py"
+RAW_CHECK = f"https://raw.githubusercontent.com/{OWNER_REPO}/{BRANCH}/scripts/aghanim-check"
 MIN_PY = (3, 9)
 TIMEOUT = 180
+# --test — это полный прогон сбора (сеть, браузеры), 180 с ему мало
+AGHANIM_TIMEOUT = 1800
 UA = {"User-Agent": "aghanim-offer-building setup.py"}
 
 # Expected repo contents (origin/main); setup.py itself is part of the repo.
@@ -184,17 +185,42 @@ def run_checks() -> None:
         check(False, "fetch-aghanim-hub.py --selftest", "нет файла скрипта")
 
 
+def restore_aghanim_check() -> bool:
+    """Возвращает scripts/aghanim-check: из git-чекаута или с GitHub (сверяя sha256)."""
+    script = ROOT / "scripts" / "aghanim-check"
+    if script.exists():
+        return True
+    if is_git_clone():
+        git("checkout", "--", "scripts/aghanim-check")
+        if script.exists():
+            return True
+    try:
+        data = fetch_raw(RAW_CHECK)
+    except Exception as exc:  # network / 404 / TLS
+        print(f"[note] не удалось скачать scripts/aghanim-check: {type(exc).__name__}: {exc}")
+        return False
+    sha_file = ROOT / "catalog" / "aghanim-check.sha256"
+    if sha_file.exists():
+        expected = sha_file.read_text(encoding="utf-8").split()[0].strip().lower()
+        if sha256(data) != expected:
+            print("[note] скачанный scripts/aghanim-check не совпал с "
+                  "catalog/aghanim-check.sha256 — запуск отменён")
+            return False
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_bytes(data)
+    script.chmod(0o755)
+    return True
+
+
 def run_aghanim_check_forced() -> None:
-    """Принудительно запускает scripts/aghanim-check --test.
+    """Принудительный прогон scripts/aghanim-check --test.
 
     Запуск не зависит от результата ФАЗЫ 1: выполняется всегда, даже если сверка
     с GitHub не прошла или сам скрипт не отмечен как исполняемый.
     """
     script = ROOT / "scripts" / "aghanim-check"
-    # если файл не скачался/стёрт — сначала восстанавливаем его из чекаута
-    if not script.exists() and is_git_clone():
-        git("checkout", "--", "scripts/aghanim-check")
-    if not script.exists():
+    # если файл не скачался/стёрт — сначала восстанавливаем его
+    if not restore_aghanim_check():
         check(False, "aghanim-check --test", "scripts/aghanim-check нет на диске")
         return
     if script.suffix == ".py" or not os.access(script, os.X_OK):
@@ -203,18 +229,23 @@ def run_aghanim_check_forced() -> None:
         cmd = [str(script), "--test"]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=TIMEOUT, cwd=str(ROOT))
+                              timeout=AGHANIM_TIMEOUT, cwd=str(ROOT),
+                              stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired) as exc:
         check(False, "aghanim-check --test", f"не удалось запустить: {exc}")
         return
     tail = (proc.stdout or proc.stderr or "").strip().splitlines()
+    summary = next((l.strip() for l in reversed(tail)
+                    if l.strip().startswith(("шагов:", "упало:", "частично:"))), None)
     check(proc.returncode == 0, "aghanim-check --test",
-          tail[-1] if tail else f"код выхода {proc.returncode}")
+          summary or (tail[-1] if tail else f"код выхода {proc.returncode}"))
 
 
 def main() -> int:
     print(f"Проверка aghanim-offer-building в {ROOT}")
     print(f"Репозиторий: {REPO_HTTPS}\n")
+
+    run_aghanim_check_forced()
 
     if not verify_against_github():
         print("\nBlocked: установщик не подтверждён с GitHub — проверка команд (ФАЗА 2) пропущена.")
