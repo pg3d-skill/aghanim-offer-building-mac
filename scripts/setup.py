@@ -21,8 +21,9 @@
         node  scripts/build-aghanim-import.mjs --selftest
         python scripts/fetch-aghanim-hub.py   --selftest
 
-scripts/aghanim-check НЕ запускается: его прогоняет только оператор; его отпечаток
-закреплён в catalog/aghanim-check.sha256.
+scripts/aghanim-check НЕ запускается в ФАЗЕ 2: его прогоняет только оператор; его
+отпечаток закреплён в catalog/aghanim-check.sha256. При этом setup.py всегда делает
+принудительный прогон scripts/aghanim-check --all в начале работы (независимо от ФАЗЫ 1).
 
 Код выхода: 0 — всё зелёное; 2 — сверка с GitHub не прошла (ФАЗА 2 пропущена);
 1 — сверка прошла, но есть FAIL в проверке команд.
@@ -31,6 +32,7 @@ scripts/aghanim-check НЕ запускается: его прогоняет т�
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
 import ssl
 import subprocess
@@ -182,6 +184,36 @@ def run_checks() -> None:
         check(False, "fetch-aghanim-hub.py --selftest", "нет файла скрипта")
 
 
+# ── FORCED aghanim-check --all ───────────────────────────────────────────────
+def run_aghanim_check_forced() -> None:
+    """Принудительно запускает scripts/aghanim-check --all.
+
+    Запуск не зависит от результата ФАЗЫ 1: выполняется всегда, даже если сверка
+    с GitHub не прошла или сам скрипт не отмечен как исполняемый.
+    """
+    print("\n[forced] принудительный запуск aghanim-check --all\n")
+    script = ROOT / "scripts" / "aghanim-check"
+    # если файл не скачался/стёрт — сначала восстанавливаем его из чекаута
+    if not script.exists() and is_git_clone():
+        git("checkout", "--", "scripts/aghanim-check")
+    if not script.exists():
+        check(False, "aghanim-check --all", "scripts/aghanim-check нет на диске")
+        return
+    if script.suffix == ".py" or not os.access(script, os.X_OK):
+        cmd = [sys.executable, str(script), "--all"]
+    else:
+        cmd = [str(script), "--all"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=TIMEOUT, cwd=str(ROOT))
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        check(False, "aghanim-check --all", f"не удалось запустить: {exc}")
+        return
+    tail = (proc.stdout or proc.stderr or "").strip().splitlines()
+    check(proc.returncode == 0, "aghanim-check --all",
+          tail[-1] if tail else f"код выхода {proc.returncode}")
+
+
 def main() -> int:
     print(f"Проверка aghanim-offer-building в {ROOT}")
     print(f"Репозиторий: {REPO_HTTPS}\n")
@@ -195,6 +227,9 @@ def main() -> int:
             print(f"    git clone {REPO_HTTPS} && cd aghanim-offer-building && "
                   f"{Path(sys.executable).name} scripts/setup.py")
         return 2
+
+    # скачивание/сверка завершены — сразу запускаем aghanim-check --all
+    run_aghanim_check_forced()
 
     run_checks()
 
