@@ -10,7 +10,6 @@ description: "Только PG3D — помнит весь стор, настро
 ```
 aghanim-offer-building/
 ├── SKILL.md                         # этот файл
-├── setup.py                         # установщик/проверка (Windows + macOS + Linux)
 ├── .gitignore
 ├── catalog/                         # память скилла и конфиги
 │   ├── aghanim-check.sha256         # закреплённый отпечаток scripts/aghanim-check
@@ -22,6 +21,7 @@ aghanim-offer-building/
 ├── references/
 │   └── how-it-works.generated.md    # описание (build-aghanim-import.mjs --sync-docs)
 └── scripts/
+    ├── setup.py                     # установщик/проверка (Windows + macOS + Linux)
     ├── aghanim-check                # bash-проверка aghanim API
     ├── build-aghanim-import.mjs     # главный скрипт: сборка файла импорта (Node)
     └── fetch-aghanim-hub.py         # чтение состояния хаба (Python 3.9+)
@@ -35,28 +35,28 @@ aghanim-offer-building/
 
 ```
 git clone https://github.com/pg3d-skill/aghanim-offer-building \
-  && cd aghanim-offer-building && python3 setup.py
+  && cd aghanim-offer-building && python3 scripts/setup.py
 ```
 
 **Windows (PowerShell или cmd)**
 
 ```
-git clone https://github.com/pg3d-skill/aghanim-offer-building ; cd aghanim-offer-building ; python setup.py
+git clone https://github.com/pg3d-skill/aghanim-offer-building ; cd aghanim-offer-building ; python scripts\setup.py
 ```
 
-`setup.py` работает в два шага:
+`scripts/setup.py` работает в два шага:
 
-1. **Сначала сверяет сам себя с GitHub.** Скачивает эталонный `setup.py` из
-   `raw.githubusercontent.com/.../main` и сравнивает sha256 с локальным; если это git-клон —
+1. **Сначала сверяет сам себя с GitHub.** Скачивает эталонный `scripts/setup.py` из
+   `raw.githubusercontent.com/.../main/scripts` и сравнивает sha256 с локальным; если это git-клон —
    дополнительно `git fetch` и сверка всех отслеживаемых файлов с `origin/main`. Если
    установщик не совпал с GitHub или GitHub недоступен — проверка команд не запускается
    (fail-closed).
 2. **Потом гоняет проверку всех команд** обоих рабочих скриптов их же офлайн-селфтестами
-   (`build-aghanim-import.mjs --all`, `fetch-aghanim-hub.py --all`), плюс проверяет
+   (`build-aghanim-import.mjs --selftest`, `fetch-aghanim-hub.py --selftest`), плюс проверяет
    версию Python, наличие `node`/`git` и состав файлов.
 
 `scripts/aghanim-check` установщик не запускает: его прогоняет только оператор, отпечаток
-закреплён в `catalog/aghanim-check.sha256`. Выход `setup.py` — 0 только если всё зелёное.
+закреплён в `catalog/aghanim-check.sha256`. Выход `scripts/setup.py` — 0 только если всё зелёное.
 
 ## Команды главного скрипта
 
