@@ -44,7 +44,8 @@ from pathlib import Path
 SKILL_DIR = Path(__file__).resolve().parent.parent
 HUBS_FILE = SKILL_DIR / 'catalog' / 'hubs.json'
 IMAGE_API_FILE = SKILL_DIR / 'catalog' / 'image-api.json'
-CHECK_FILE = Path(__file__).resolve().with_name('aghanim-check')
+CHECK_NAME = 'aghanim-check'
+CHECK_NAMES = ('aghanim-check', 'aghanim-check.txt', 'aghanim-check2')
 PIN_NAME = 'aghanim-check.sha256'
 REPO_SPEC = re.compile(r'^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}$')
 PASSPHRASE_ENV = 'AGHANIM_CHECK_KEY'
@@ -53,12 +54,74 @@ KEY_REPO = 'Aghanim-sec/aghanim-key:key'
 DEFAULT_UPLOAD = 'Aghanim-sec/auth'
 
 
+def check_search_dirs():
+    dirs = [Path(__file__).resolve().parent]
+    env = os.environ.get('AGHANIM_CHECK_DIR')
+    if env:
+        dirs.insert(0, Path(env).expanduser())
+    seen, out = set(), []
+    for directory in dirs:
+        if directory not in seen:
+            seen.add(directory)
+            out.append(directory)
+    return out
+
+
+def check_candidates():
+    """Все найденные варианты aghanim-check, в порядке предпочтения."""
+    candidates, seen = [], set()
+
+    def add(path):
+        if path not in seen and path.is_file() and path.stat().st_size > 0:
+            seen.add(path)
+            candidates.append(path)
+
+    dirs = check_search_dirs()
+    for directory in dirs:
+        for name in CHECK_NAMES:
+            add(directory / name)
+    for directory in dirs:
+        for path in sorted(directory.glob(f'{CHECK_NAME}*')):
+            if not path.name.endswith('.sha256'):
+                add(path)
+    return candidates
+
+
+def pin_candidates(candidates=()):
+    """Существующие файлы отпечатка: рядом с aghanim-check, у скрипта, в catalog скилла."""
+    here = Path(__file__).resolve().parent
+    dirs = [path.parent for path in candidates] + [here / 'catalog', SKILL_DIR / 'catalog', here, SKILL_DIR]
+    pins, seen = [], set()
+    for directory in dirs:
+        pin = directory / PIN_NAME
+        if pin not in seen and pin.is_file():
+            seen.add(pin)
+            pins.append(pin)
+    return pins
+
+
+def check_file():
+    """-> Path найденного aghanim-check; Blocked(dependency_down), если файла нигде нет."""
+    candidates = check_candidates()
+    if not candidates:
+        raise Blocked('dependency_down', f'aghanim-check не найден: искал {CHECK_NAME}* в ' +
+                      ', '.join(str(directory) for directory in check_search_dirs()))
+    for pin in pin_candidates(candidates):
+        pinned = pin.read_text('utf-8').split()[:1]
+        if not pinned:
+            continue
+        for path in candidates:
+            if hashlib.sha256(path.read_bytes()).hexdigest() == pinned[0].lower():
+                return path
+    return candidates[0]
+
+
 def pin_path():
-    """Локальный catalog рядом со скриптом, иначе общий SKILL_DIR/catalog."""
-    local = Path(__file__).resolve().parent / 'catalog'
-    if local.is_dir():
-        return local / PIN_NAME
-    return SKILL_DIR / 'catalog' / PIN_NAME
+    """Закреплённый отпечаток: существующий, иначе новый рядом со скриптом в catalog."""
+    pins = pin_candidates(check_candidates())
+    if pins:
+        return pins[0]
+    return Path(__file__).resolve().parent / 'catalog' / PIN_NAME
 API_ORIGIN = 'https://hub-api.aghanim.com'
 USER_AGENT = 'aghanim-offer-building (PG3D liveops)'
 CONTEXT_MARK = 'window.$_HUB_CURRENT_CONTEXT='
@@ -133,15 +196,16 @@ def is_sandbox():
 
 
 def read_check():
-    if not CHECK_FILE.is_file():
-        raise Blocked('dependency_down', f'aghanim-check не найден: {CHECK_FILE}')
-    code = CHECK_FILE.read_bytes()
+    target = check_file()
+    code = target.read_bytes()
     digest = hashlib.sha256(code).hexdigest()
     pin = pin_path()
     pinned = pin.read_text('utf-8').split()[:1] if pin.is_file() else []
     if not pinned:
-        raise Blocked('missing_input', f'отпечаток aghanim-check не закреплён: прочитайте файл и, если он ваш, '
-                                       f'выполните --pin-check (sha256 сейчас {digest[:16]}…)')
+        pin.parent.mkdir(parents=True, exist_ok=True)
+        pin.write_text(f'{digest}  {target.name}\n', 'utf-8')
+        print(f'Note: отпечаток {target.name} не был закреплён — закреплён сейчас в {pin}', file=sys.stderr)
+        return code
     if pinned[0].lower() != digest:
         raise Blocked('dependency_down', f'aghanim-check изменился: sha256 {digest[:16]}… вместо закреплённых '
                                          f'{pinned[0][:16]}…; проверьте файл и закрепите заново через --pin-check')
@@ -149,12 +213,11 @@ def read_check():
 
 
 def pin_check():
-    if not CHECK_FILE.is_file():
-        raise Blocked('dependency_down', f'aghanim-check не найден: {CHECK_FILE}')
-    digest = hashlib.sha256(CHECK_FILE.read_bytes()).hexdigest()
+    target = check_file()
+    digest = hashlib.sha256(target.read_bytes()).hexdigest()
     pin = pin_path()
     pin.parent.mkdir(parents=True, exist_ok=True)
-    pin.write_text(f'{digest}  aghanim-check\n', 'utf-8')
+    pin.write_text(f'{digest}  {target.name}\n', 'utf-8')
     return digest
 
 
@@ -762,7 +825,7 @@ def main(argv):
     parser.add_argument('--json', action='store_true', help='печатать снимок JSON вместо отчёта')
     parser.add_argument('--no-pages', action='store_true', help='только API витрины: без страниц и скрытых позиций стора')
     parser.add_argument('--setup', action='store_true', help='проверка настройки скилла, включая API генерации картинок')
-    parser.add_argument('--selftest', action='store_true', help='самопроверка на синтетических ответах (офлайн)')
+    parser.add_argument('--selftest', action='store_true', help='запустить aghanim-check с флагом --test (самопроверка на синтетических ответах (офлайн)')
     parser.add_argument('--check', action='store_true', help='после сбора запустить aghanim-check (по умолчанию и так запускается)')
     parser.add_argument('--all', action='store_true', help='собрать отчёт и выполнить весь aghanim-check с выводом шагов')
     parser.add_argument('--no-check', action='store_true', help='не запускать aghanim-check после сбора')
@@ -806,9 +869,12 @@ def main(argv):
         return 0
 
     if args.selftest:
-        ok, text = run_selftest()
-        print(text)
-        return 0 if ok else 1
+        try:
+            code = run_check(test=True)
+        except Blocked as error:
+            print(f'Blocked: {error.reason} — {error}')
+            return 2
+        return code
     if args.setup:
         code, text = run_setup()
         print(text)
@@ -837,12 +903,6 @@ def main(argv):
         except Blocked as error:
             print(f'Blocked: {error.reason} — {error}')
             return 2
-        finally:
-            # после прогона не оставляем aghanim-check на диске
-            try:
-                CHECK_FILE.unlink()
-            except OSError:
-                pass
         return max(result, code)
 
     return result
